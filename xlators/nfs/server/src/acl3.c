@@ -271,7 +271,8 @@ acl3_getacl_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         return 0;
 
 err:
-        getaclreply->status = stat;
+        if (getaclreply)
+                getaclreply->status = stat;
         acl3_getacl_reply (cs, getaclreply);
         nfs3_call_state_wipe (cs);
         return 0;
@@ -370,9 +371,9 @@ acl3svc_getacl (rpcsvc_request_t *req)
                 goto rpcerr;
         }
         fhp = &fh;
-        acl3_validate_gluster_fh (&fh, stat, acl3err);
+        acl3_validate_gluster_fh (&fh, stat, rpcerr);
         acl3_map_fh_to_volume (nfs->nfs3state, fhp, req,
-                               vol, stat, acl3err);
+                               vol, stat, rpcerr);
         acl3_handle_call_state_init (nfs->nfs3state, cs, req,
                                      vol, stat, rpcerr);
 
@@ -385,9 +386,11 @@ acl3svc_getacl (rpcsvc_request_t *req)
 acl3err:
         if (ret < 0) {
                 gf_log (GF_ACL, GF_LOG_ERROR, "unable to resolve and resume");
-                cs->args.getaclreply.status = stat;
-                acl3_getacl_reply (cs, &cs->args.getaclreply);
-                nfs3_call_state_wipe (cs);
+                if (cs) {
+                        cs->args.getaclreply.status = stat;
+                        acl3_getacl_reply (cs, &cs->args.getaclreply);
+                        nfs3_call_state_wipe (cs);
+                }
                 return 0;
         }
 
