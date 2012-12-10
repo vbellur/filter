@@ -47,6 +47,7 @@ struct gf_filter {
 	char fixed_uid_set;
 	char fixed_gid_set;
 	char partial_filter;
+        gf_boolean_t root_squash;
 
 	/* Options */
 	/* Mapping/Filtering/Translate whatever you want to call */
@@ -66,14 +67,14 @@ struct gf_filter {
 	int filter_num_gid_entries;
 	int filter_input_uid[GF_MAXIMUM_FILTERING_ALLOWED][2];
 	int filter_input_gid[GF_MAXIMUM_FILTERING_ALLOWED][2];
-	
+
 };
 
 /* update_frame: The main logic of the whole translator.
    Return values:
    0: no change
    // TRANSLATE
-   1: only uid changed 
+   1: only uid changed
    2: only gid changed
    3: both uid/gid changed
    // FILTER
@@ -100,29 +101,37 @@ update_frame (call_frame_t *frame,
 	int32_t  ret = 0;
 	int32_t  dictret = 0;
 	uint64_t tmp_uid = 0;
-	
+
 	for (idx = 0; idx < filter->translate_num_uid_entries; idx++) {
 		if ((frame->root->uid >=filter->translate_input_uid[idx][0]) &&
 		    (frame->root->uid <=filter->translate_input_uid[idx][1])) {
 			dictret = inode_ctx_get (inode, frame->this, &tmp_uid);
 			uid = (uid_t)tmp_uid;
-			if (dictret == 0) {
-				if (frame->root->uid != uid)
+                        if (filter->root_squash &&
+                                        GF_FILTER_ROOT_UID == frame->root->uid) {
+                                frame->root->uid = filter->translate_output_uid[idx];
+                        } else if (dictret == 0) {
+				if (frame->root->uid != uid) {
 					ret = GF_FILTER_MAP_UID;
+                                }
 			} else {
 				ret = GF_FILTER_MAP_UID;
 			}
 			break;
 		}
 	}
-	
+
 	for (idx = 0; idx < filter->translate_num_gid_entries; idx++) {
 		if ((frame->root->gid >=filter->translate_input_gid[idx][0]) &&
 		    (frame->root->gid <=filter->translate_input_gid[idx][1])) {
-			if (ret == GF_FILTER_NO_CHANGE) 
+                        if (filter->root_squash &&
+                                        GF_FILTER_ROOT_GID == frame->root->gid) {
+                                frame->root->gid = filter->translate_output_gid[idx];
+                        } else if (ret == GF_FILTER_NO_CHANGE) {
 				ret = GF_FILTER_MAP_GID;
-			else 
+                        } else {
 				ret = GF_FILTER_MAP_BOTH;
+                        }
 			break;
 		}
 	}
@@ -130,12 +139,12 @@ update_frame (call_frame_t *frame,
 
 	if (filter->complete_read_only)
 		return GF_FILTER_RO_FS;
-	
+
 	if (filter->partial_filter) {
 		dictret = inode_ctx_get (inode, frame->this, &tmp_uid);
 		uid = (uid_t)tmp_uid;
 		if (dictret != -1) {
-			for (idx = 0; idx < filter->filter_num_uid_entries; 
+			for (idx = 0; idx < filter->filter_num_uid_entries;
 			     idx++) {
 				if ((uid >=filter->filter_input_uid[idx][0]) &&
 				    (uid <=filter->filter_input_uid[idx][1])) {
@@ -154,6 +163,13 @@ update_stat (struct iatt *stbuf,
 	     struct gf_filter *filter)
 {
 	int32_t idx = 0;
+
+        GF_ASSERT (filter);
+        GF_ASSERT (stbuf);
+
+        if (filter->root_squash)
+                goto out;
+
 	for (idx = 0; idx < filter->translate_num_uid_entries; idx++) {
 		if (stbuf->ia_uid == GF_FILTER_ROOT_UID)
 			continue;
@@ -163,7 +179,7 @@ update_stat (struct iatt *stbuf,
 			break;
 		}
 	}
-	
+
 	for (idx = 0; idx < filter->translate_num_gid_entries; idx++) {
 		if (stbuf->ia_gid == GF_FILTER_ROOT_GID)
 			continue;
@@ -181,11 +197,12 @@ update_stat (struct iatt *stbuf,
 	if (filter->fixed_gid_set) {
 		stbuf->ia_gid = filter->fixed_gid;
 	}
-	
+
+out:
 	return 0;
 }
 
-static int32_t 
+static int32_t
 filter_lookup_cbk (call_frame_t *frame,
 		   void *cookie,
 		   xlator_t *this,
@@ -207,11 +224,12 @@ filter_lookup_cbk (call_frame_t *frame,
 
 		update_stat (postparent, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, inode, buf, dict, postparent);
+	STACK_UNWIND_STRICT (lookup, frame, op_ret, op_errno, inode, buf,
+                             dict, postparent);
 	return 0;
 }
 
-int32_t 
+int32_t
 filter_lookup (call_frame_t *frame,
 	       xlator_t *this,
 	       loc_t *loc,
@@ -227,31 +245,31 @@ filter_lookup (call_frame_t *frame,
 }
 
 
-static int32_t
+static int
 filter_stat_cbk (call_frame_t *frame,
 		 void *cookie,
 		 xlator_t *this,
 		 int32_t op_ret,
 		 int32_t op_errno,
-		 struct iatt *buf)
+		 struct iatt *buf, dict_t *xdata)
 {
 	if (op_ret >= 0) {
 		update_stat (buf, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, buf);
+	STACK_UNWIND_STRICT (stat, frame, op_ret, op_errno, buf, xdata);
 	return 0;
 }
 
 int32_t
 filter_stat (call_frame_t *frame,
 	     xlator_t *this,
-	     loc_t *loc)
+	     loc_t *loc, dict_t *xdata)
 {
 	STACK_WIND (frame,
 		    filter_stat_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->stat,
-		    loc);
+		    loc, xdata);
 	return 0;
 }
 
@@ -262,13 +280,15 @@ filter_setattr_cbk (call_frame_t *frame,
                     int32_t op_ret,
                     int32_t op_errno,
                     struct iatt *preop,
-                    struct iatt *postop)
+                    struct iatt *postop,
+                    dict_t *xdata)
 {
 	if (op_ret >= 0) {
 		update_stat (preop, this->private);
 		update_stat (postop, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, preop, postop);
+	STACK_UNWIND_STRICT (setattr, frame, op_ret, op_errno, preop,
+                             postop, xdata);
 	return 0;
 }
 
@@ -276,38 +296,27 @@ int32_t
 filter_setattr (call_frame_t *frame,
                 xlator_t *this,
                 loc_t *loc,
-                struct iatt *stbuf,
-                int32_t valid)
+                struct iatt *iatt,
+                int32_t valid, dict_t *xdata)
 {
 	int32_t ret = 0;
-	ret = update_frame (frame, loc->inode, this->private);
-	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (loc->inode->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (loc->inode->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG,
-                        "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL, NULL, NULL);
-		return 0;
 
+	ret = update_frame (frame, loc->inode, this->private);
+
+	switch (ret) {
 	case GF_FILTER_FILTER_UID:
 	case GF_FILTER_FILTER_GID:
 	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL, NULL);
+		STACK_UNWIND_STRICT (setattr, frame, -1, EROFS, NULL, NULL,
+                                     NULL);
 		return 0;
 	default:
 		break;
 	}
 
-	STACK_WIND (frame,
-		    filter_setattr_cbk,
-		    FIRST_CHILD(this),
+	STACK_WIND (frame, filter_setattr_cbk, FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->setattr,
-		    loc,
-		    stbuf, valid);
+		    loc, iatt, valid, xdata);
 	return 0;
 }
 
@@ -318,16 +327,14 @@ filter_fsetattr_cbk (call_frame_t *frame,
                      int32_t op_ret,
                      int32_t op_errno,
                      struct iatt *preop,
-                     struct iatt *postop)
+                     struct iatt *postop, dict_t *xdata)
 {
 	if (op_ret >= 0) {
                 update_stat (preop, this->private);
 		update_stat (postop, this->private);
 	}
-	STACK_UNWIND (frame,
-		      op_ret,
-		      op_errno,
-		      preop, postop);
+	STACK_UNWIND_STRICT (fsetattr,frame, op_ret, op_errno,
+		             preop, postop, xdata);
 	return 0;
 }
 
@@ -336,14 +343,11 @@ filter_fsetattr (call_frame_t *frame,
                  xlator_t *this,
                  fd_t *fd,
                  struct iatt *stbuf,
-                 int32_t valid)
+                 int32_t valid, dict_t *xdata)
 {
-	STACK_WIND (frame,
-		    filter_fsetattr_cbk,
-		    FIRST_CHILD(this),
-		    FIRST_CHILD(this)->fops->fsetattr,
-		    fd,
-		    stbuf, valid);
+	STACK_WIND (frame, filter_fsetattr_cbk,
+		    FIRST_CHILD(this), FIRST_CHILD(this)->fops->fsetattr,
+		    fd, stbuf, valid, xdata);
 	return 0;
 }
 
@@ -355,13 +359,14 @@ filter_truncate_cbk (call_frame_t *frame,
 		     int32_t op_ret,
 		     int32_t op_errno,
 		     struct iatt *prebuf,
-                     struct iatt *postbuf)
+                     struct iatt *postbuf, dict_t *xdata)
 {
 	if (op_ret >= 0) {
 		update_stat (prebuf, this->private);
 		update_stat (postbuf, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, prebuf, postbuf);
+	STACK_UNWIND_STRICT (truncate, frame, op_ret, op_errno, prebuf, postbuf,
+                             xdata);
 	return 0;
 }
 
@@ -369,34 +374,26 @@ int32_t
 filter_truncate (call_frame_t *frame,
 		 xlator_t *this,
 		 loc_t *loc,
-		 off_t offset)
+		 off_t offset, dict_t *xdata)
 {
 	int32_t ret = 0;
+
 	ret = update_frame (frame, loc->inode, this->private);
+
 	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (loc->inode->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (loc->inode->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL, NULL);
-		return 0;
-		
 	case GF_FILTER_FILTER_UID:
 	case GF_FILTER_FILTER_GID:
 	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL, NULL);
+		STACK_UNWIND_STRICT (truncate, frame, -1, EROFS, NULL, NULL, NULL);
 		return 0;
-	}			
+	}
 
 	STACK_WIND (frame,
 		    filter_truncate_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->truncate,
 		    loc,
-		    offset);
+		    offset, xdata);
 	return 0;
 }
 
@@ -407,13 +404,14 @@ filter_ftruncate_cbk (call_frame_t *frame,
 		      int32_t op_ret,
 		      int32_t op_errno,
 		      struct iatt *prebuf,
-                      struct iatt *postbuf)
+                      struct iatt *postbuf, dict_t *xdata)
 {
 	if (op_ret >= 0) {
 		update_stat (prebuf, this->private);
 		update_stat (postbuf, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, prebuf, postbuf);
+	STACK_UNWIND_STRICT (ftruncate, frame, op_ret, op_errno, prebuf,
+                             postbuf, xdata);
 	return 0;
 }
 
@@ -421,14 +419,11 @@ int32_t
 filter_ftruncate (call_frame_t *frame,
 		  xlator_t *this,
 		  fd_t *fd,
-		  off_t offset)
+		  off_t offset, dict_t *xdata)
 {
-	STACK_WIND (frame,
-		    filter_ftruncate_cbk,
-		    FIRST_CHILD(this),
-		    FIRST_CHILD(this)->fops->ftruncate,
-		    fd,
-		    offset);
+	STACK_WIND (frame, filter_ftruncate_cbk,
+		    FIRST_CHILD(this), FIRST_CHILD(this)->fops->ftruncate,
+		    fd, offset, xdata);
 	return 0;
 }
 
@@ -440,12 +435,13 @@ filter_readlink_cbk (call_frame_t *frame,
 		     int32_t op_ret,
 		     int32_t op_errno,
 		     const char *path,
-                     struct iatt *sbuf)
+                     struct iatt *sbuf, dict_t *xdata)
 {
         if (op_ret >= 0)
                 update_stat (sbuf, this->private);
 
-	STACK_UNWIND (frame, op_ret, op_errno, path, sbuf);
+	STACK_UNWIND_STRICT (readlink, frame, op_ret, op_errno, path, sbuf,
+                             xdata);
 	return 0;
 }
 
@@ -453,27 +449,17 @@ int32_t
 filter_readlink (call_frame_t *frame,
 		 xlator_t *this,
 		 loc_t *loc,
-		 size_t size)
+		 size_t size, dict_t *xdata)
 {
 	int32_t ret = 0;
 	ret = update_frame (frame, loc->inode, this->private);
-	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (loc->inode->st_mode & S_IRGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (loc->inode->st_mode & S_IROTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL);
-		return 0;
-	}			
+
 	STACK_WIND (frame,
 		    filter_readlink_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->readlink,
 		    loc,
-		    size);
+		    size, xdata);
 	return 0;
 }
 
@@ -487,7 +473,7 @@ filter_mknod_cbk (call_frame_t *frame,
 		  inode_t *inode,
                   struct iatt *buf,
                   struct iatt *preparent,
-                  struct iatt *postparent)
+                  struct iatt *postparent, dict_t *xdata)
 {
 	int ret = 0;
 
@@ -502,8 +488,8 @@ filter_mknod_cbk (call_frame_t *frame,
 		update_stat (preparent, this->private);
 		update_stat (postparent, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, inode, buf,
-                      preparent, postparent);
+	STACK_UNWIND_STRICT (mknod, frame, op_ret, op_errno, inode, buf,
+                             preparent, postparent, xdata);
 	return 0;
 }
 
@@ -512,35 +498,23 @@ filter_mknod (call_frame_t *frame,
 	      xlator_t *this,
 	      loc_t *loc,
 	      mode_t mode,
-	      dev_t rdev)
+	      dev_t rdev, mode_t umask, dict_t *xdata)
 {
 	int ret = 0;
-	inode_t *parent = loc->parent;
 	ret = update_frame (frame, loc->inode, this->private);
-	switch (ret) {		
-	case GF_FILTER_MAP_UID:
-		if (parent->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (parent->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL, NULL,
-                              NULL, NULL);
-		return 0;
-
+	switch (ret) {
 	case GF_FILTER_FILTER_UID:
 	case GF_FILTER_FILTER_GID:
 	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL, NULL,
-                              NULL, NULL);
+		STACK_UNWIND_STRICT (mknod, frame, -1, EROFS, NULL, NULL,
+                                     NULL, NULL, NULL);
 		return 0;
 	}
 	STACK_WIND (frame,
 		    filter_mknod_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->mknod,
-		    loc, mode, rdev);
+		    loc, mode, rdev, umask, xdata);
 	return 0;
 }
 
@@ -553,7 +527,7 @@ filter_mkdir_cbk (call_frame_t *frame,
 		  inode_t *inode,
                   struct iatt *buf,
                   struct iatt *preparent,
-                  struct iatt *postparent)
+                  struct iatt *postparent, dict_t *xdata)
 {
 	int ret = 0;
 	if (op_ret >= 0) {
@@ -567,8 +541,8 @@ filter_mkdir_cbk (call_frame_t *frame,
 		update_stat (preparent, this->private);
 		update_stat (postparent, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, inode, buf,
-                      preparent, postparent);
+	STACK_UNWIND_STRICT (mkdir, frame, op_ret, op_errno, inode, buf,
+                             preparent, postparent, xdata);
 	return 0;
 }
 
@@ -576,35 +550,23 @@ int32_t
 filter_mkdir (call_frame_t *frame,
 	      xlator_t *this,
 	      loc_t *loc,
-	      mode_t mode)
+	      mode_t mode, mode_t umask, dict_t *xdata)
 {
 	int ret = 0;
-	inode_t *parent = loc->parent;
 	ret = update_frame (frame, loc->inode, this->private);
-	switch (ret) {		
-	case GF_FILTER_MAP_UID:
-		if (parent->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (parent->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL, NULL,
-                              NULL, NULL);
-		return 0;
-
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL, NULL,
-                              NULL, NULL);
+	switch (ret) {
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        STACK_UNWIND_STRICT (mkdir, frame, -1, EROFS, NULL,
+                                    NULL, NULL, NULL, NULL);
 		return 0;
 	}
 	STACK_WIND (frame,
 		    filter_mkdir_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->mkdir,
-		    loc, mode);
+		    loc, mode, umask, xdata);
 	return 0;
 }
 
@@ -615,21 +577,22 @@ filter_unlink_cbk (call_frame_t *frame,
 		   int32_t op_ret,
 		   int32_t op_errno,
                    struct iatt *preparent,
-                   struct iatt *postparent)
+                   struct iatt *postparent, dict_t *xdata)
 {
         if (op_ret >= 0) {
 		update_stat (preparent, this->private);
 		update_stat (postparent, this->private);
         }
 
-	STACK_UNWIND (frame, op_ret, op_errno, preparent, postparent);
+	STACK_UNWIND_STRICT (unlink, frame, op_ret, op_errno, preparent,
+                             postparent, xdata);
 	return 0;
 }
 
 int32_t
 filter_unlink (call_frame_t *frame,
 	       xlator_t *this,
-	       loc_t *loc)
+	       loc_t *loc, int xflag, dict_t *xdata)
 {
 	int32_t ret = 0;
 	inode_t *parent = loc->parent;
@@ -637,30 +600,18 @@ filter_unlink (call_frame_t *frame,
 		parent = inode_parent (loc->inode, 0, NULL);
 	ret = update_frame (frame, loc->inode, this->private);
 	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (parent->st_mode & S_IWGRP)
-			break;
-		if (loc->inode->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (parent->st_mode & S_IWOTH)
-			break;
-		if (loc->inode->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL, NULL);
-		return 0;
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL, NULL);
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        STACK_UNWIND_STRICT (unlink, frame, -1, EROFS, NULL,
+                                        NULL, NULL);
 		return 0;
 	}
 	STACK_WIND (frame,
 		    filter_unlink_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->unlink,
-		    loc);
+		    loc, xflag, xdata);
 	return 0;
 }
 
@@ -671,21 +622,22 @@ filter_rmdir_cbk (call_frame_t *frame,
 		  int32_t op_ret,
 		  int32_t op_errno,
                   struct iatt *preparent,
-                  struct iatt *postparent)
+                  struct iatt *postparent, dict_t *xdata)
 {
         if (op_ret >= 0) {
 		update_stat (preparent, this->private);
 		update_stat (postparent, this->private);
         }
 
-	STACK_UNWIND (frame, op_ret, op_errno, preparent, postparent);
+	STACK_UNWIND_STRICT (rmdir, frame, op_ret, op_errno, preparent, postparent,
+                             xdata);
 	return 0;
 }
 
 int32_t
 filter_rmdir (call_frame_t *frame,
 	      xlator_t *this,
-	      loc_t *loc)
+	      loc_t *loc, int flags, dict_t *xdata)
 {
 	int32_t ret = 0;
 	inode_t *parent = loc->parent;
@@ -693,30 +645,18 @@ filter_rmdir (call_frame_t *frame,
 		parent = inode_parent (loc->inode, 0, NULL);
 	ret = update_frame (frame, loc->inode, this->private);
 	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (parent->st_mode & S_IWGRP)
-			break;
-		if (loc->inode->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (parent->st_mode & S_IWOTH)
-			break;
-		if (loc->inode->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL, NULL);
-		return 0;
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-                STACK_UNWIND (frame, -1, EROFS, NULL, NULL);
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        STACK_UNWIND_STRICT (rmdir, frame, -1, EROFS, NULL,
+                                        NULL, NULL);
                 return 0;
-	}			
+	}
 	STACK_WIND (frame,
 		    filter_rmdir_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->rmdir,
-		    loc);
+		    loc, flags, xdata);
 	return 0;
 }
 
@@ -729,7 +669,7 @@ filter_symlink_cbk (call_frame_t *frame,
 		    inode_t *inode,
                     struct iatt *buf,
                     struct iatt *preparent,
-                    struct iatt *postparent)
+                    struct iatt *postparent, dict_t *xdata)
 {
 	int ret = 0;
 	if (op_ret >= 0) {
@@ -743,8 +683,8 @@ filter_symlink_cbk (call_frame_t *frame,
 		update_stat (preparent, this->private);
 		update_stat (postparent, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, inode, buf,
-                      preparent, postparent);
+	STACK_UNWIND_STRICT (symlink, frame, op_ret, op_errno, inode, buf,
+                             preparent, postparent, xdata);
 	return 0;
 }
 
@@ -752,35 +692,23 @@ int32_t
 filter_symlink (call_frame_t *frame,
 		xlator_t *this,
 		const char *linkpath,
-		loc_t *loc)
+		loc_t *loc, mode_t umask, dict_t *xdata)
 {
 	int ret = 0;
-	inode_t *parent = loc->parent;
 	ret = update_frame (frame, loc->inode, this->private);
-	switch (ret) {		
-	case GF_FILTER_MAP_UID:
-		if (parent->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (parent->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL, NULL,
-                              NULL, NULL);
-		return 0;
-
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL, NULL,
-                              NULL, NULL);
+	switch (ret) {
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        STACK_UNWIND_STRICT (symlink, frame, -1, EROFS, NULL,
+                                        NULL, NULL, NULL, NULL);
 		return 0;
 	}
 	STACK_WIND (frame,
 		    filter_symlink_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->symlink,
-		    linkpath, loc);
+		    linkpath, loc, umask, xdata);
 	return 0;
 }
 
@@ -795,7 +723,7 @@ filter_rename_cbk (call_frame_t *frame,
                    struct iatt *preoldparent,
                    struct iatt *postoldparent,
                    struct iatt *prenewparent,
-                   struct iatt *postnewparent)
+                   struct iatt *postnewparent, dict_t *xdata)
 {
 	if (op_ret >= 0) {
 		update_stat (buf, this->private);
@@ -807,9 +735,9 @@ filter_rename_cbk (call_frame_t *frame,
 		update_stat (postnewparent, this->private);
 	}
 
-	STACK_UNWIND (frame, op_ret, op_errno, buf,
-                      preoldparent, postoldparent,
-                      prenewparent, postnewparent);
+	STACK_UNWIND_STRICT (rename, frame, op_ret, op_errno, buf,
+                             preoldparent, postoldparent,
+                             prenewparent, postnewparent, NULL);
 	return 0;
 }
 
@@ -817,44 +745,24 @@ int32_t
 filter_rename (call_frame_t *frame,
 	       xlator_t *this,
 	       loc_t *oldloc,
-	       loc_t *newloc)
+	       loc_t *newloc, dict_t *xdata)
 {
 	int32_t ret = 0;
-	inode_t *parent = oldloc->parent;
-	if (!parent)
-		parent = inode_parent (oldloc->inode, 0, NULL);
-	ret = update_frame (frame, oldloc->inode, this->private);
-	switch (ret) {		
-	case GF_FILTER_MAP_UID:
-		if (parent->st_mode & S_IWGRP)
-			break;
-		if (oldloc->inode->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (parent->st_mode & S_IWOTH)
-			break;
-		if (oldloc->inode->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, 
-			"%s -> %s: returning permission denied", oldloc->path, newloc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL,
-                              NULL, NULL,
-                              NULL, NULL);
-		return 0;
 
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL,
-                              NULL, NULL,
-                              NULL, NULL);
-		return 0;
-	}
+	ret = update_frame (frame, oldloc->inode, this->private);
+	switch (ret) {
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        STACK_UNWIND_STRICT (rename, frame, -1, EROFS,
+                                NULL, NULL, NULL, NULL, NULL, NULL);
+                        return 0;
+        }
 	STACK_WIND (frame,
 		    filter_rename_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->rename,
-		    oldloc, newloc);
+		    oldloc, newloc, xdata);
 	return 0;
 }
 
@@ -868,7 +776,7 @@ filter_link_cbk (call_frame_t *frame,
 		 inode_t *inode,
                  struct iatt *buf,
                  struct iatt *preparent,
-                 struct iatt *postparent)
+                 struct iatt *postparent, dict_t *xdata)
 {
 	int ret = 0;
 	if (op_ret >= 0) {
@@ -882,8 +790,8 @@ filter_link_cbk (call_frame_t *frame,
 		update_stat (preparent, this->private);
 		update_stat (postparent, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, inode, buf,
-                      preparent, postparent);
+	STACK_UNWIND_STRICT (link, frame, op_ret, op_errno, inode, buf,
+                             preparent, postparent, xdata);
 	return 0;
 }
 
@@ -891,7 +799,7 @@ int32_t
 filter_link (call_frame_t *frame,
 	     xlator_t *this,
 	     loc_t *oldloc,
-	     loc_t *newloc)
+	     loc_t *newloc, dict_t *xdata)
 {
 	int ret = 0;
 	ret = update_frame (frame, oldloc->inode, this->private);
@@ -899,15 +807,15 @@ filter_link (call_frame_t *frame,
 	case GF_FILTER_FILTER_UID:
 	case GF_FILTER_FILTER_GID:
 	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL, NULL,
-                              NULL, NULL);
+		STACK_UNWIND_STRICT (link, frame, -1, EROFS, NULL, NULL,
+                                     NULL, NULL, NULL);
 		return 0;
 	}
 	STACK_WIND (frame,
 		    filter_link_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->link,
-		    oldloc, newloc);
+		    oldloc, newloc, xdata);
 	return 0;
 }
 
@@ -922,7 +830,7 @@ filter_create_cbk (call_frame_t *frame,
 		   inode_t *inode,
 		   struct iatt *buf,
                    struct iatt *preparent,
-                   struct iatt *postparent)
+                   struct iatt *postparent, dict_t *xdata)
 {
 	int ret = 0;
 	if (op_ret >= 0) {
@@ -935,8 +843,8 @@ filter_create_cbk (call_frame_t *frame,
 		update_stat (preparent, this->private);
 		update_stat (postparent, this->private);
 	}
-	STACK_UNWIND (frame, op_ret, op_errno, fd, inode, buf,
-                      preparent, postparent);
+	STACK_UNWIND_STRICT (create, frame, op_ret, op_errno, fd, inode, buf,
+                             preparent, postparent, xdata);
 	return 0;
 }
 
@@ -945,34 +853,22 @@ filter_create (call_frame_t *frame,
 	       xlator_t *this,
 	       loc_t *loc,
 	       int32_t flags,
-	       mode_t mode, fd_t *fd)
+	       mode_t mode, mode_t umask, fd_t *fd, dict_t *xdata)
 {
 	int ret = 0;
-	inode_t *parent = loc->parent;
 	ret = update_frame (frame, loc->inode, this->private);
-	switch (ret) {		
-	case GF_FILTER_MAP_UID:
-		if (parent->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (parent->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL, NULL, NULL,
-                              NULL, NULL);
-		return 0;
-
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL, NULL, NULL,
-                              NULL, NULL);
-		return 0;
+	switch (ret) {
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        STACK_UNWIND_STRICT (create, frame, -1, EROFS, NULL,
+                                        NULL, NULL, NULL, NULL, NULL);
+                        return 0;
 	}
 	STACK_WIND (frame, filter_create_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->create,
-		    loc, flags, mode, fd);
+		    loc, flags, mode, umask, fd, xdata);
 	return 0;
 }
 
@@ -982,9 +878,9 @@ filter_open_cbk (call_frame_t *frame,
 		 xlator_t *this,
 		 int32_t op_ret,
 		 int32_t op_errno,
-		 fd_t *fd)
+		 fd_t *fd, dict_t *xdata)
 {
-	STACK_UNWIND (frame, op_ret, op_errno, fd);
+	STACK_UNWIND_STRICT (open, frame, op_ret, op_errno, fd, xdata);
 	return 0;
 }
 
@@ -992,47 +888,28 @@ int32_t
 filter_open (call_frame_t *frame,
 	     xlator_t *this,
 	     loc_t *loc,
-	     int32_t flags, 
+	     int32_t flags,
 	     fd_t *fd,
-             int32_t wbflags)
+             dict_t *xdata)
 {
 	int32_t ret = 0;
 	ret = update_frame (frame, loc->inode, this->private);
 	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (loc->inode->st_mode & S_IWGRP)
-			break;
-		if (!(((flags & O_ACCMODE) == O_WRONLY)
-                      || ((flags & O_ACCMODE) == O_RDWR))
-		    && (loc->inode->st_mode & S_IRGRP))
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (loc->inode->st_mode & S_IWOTH)
-				break;
-		if (!(((flags & O_ACCMODE) == O_WRONLY)
-                      || ((flags & O_ACCMODE) == O_RDWR))
-		    && (loc->inode->st_mode & S_IROTH))
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, 
-			"%s: returning permission denied (mode: 0%o, flag=0%o)", 
-			loc->path, loc->inode->st_mode, flags);
-		STACK_UNWIND (frame, -1, EPERM, fd);
-		return 0;
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-		if (!(((flags & O_ACCMODE) == O_WRONLY)
-                      || ((flags & O_ACCMODE) == O_RDWR)))
-			break;
-		STACK_UNWIND (frame, -1, EROFS, NULL);
-		return 0;
-		
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        if (!(((flags & O_ACCMODE) == O_WRONLY)
+                                        || ((flags & O_ACCMODE) == O_RDWR)))
+                                break;
+                        STACK_UNWIND_STRICT (open, frame, -1, EROFS, NULL,
+                                             NULL);
+                        return 0;
 	}
 	STACK_WIND (frame,
 		    filter_open_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->open,
-		    loc, flags, fd, wbflags);
+		    loc, flags, fd, xdata);
 	return 0;
 }
 
@@ -1045,18 +922,13 @@ filter_readv_cbk (call_frame_t *frame,
 		  struct iovec *vector,
 		  int32_t count,
 		  struct iatt *stbuf,
-                  struct iobref *iobref)
+                  struct iobref *iobref, dict_t *xdata)
 {
 	if (op_ret >= 0) {
 		update_stat (stbuf, this->private);
 	}
-	STACK_UNWIND (frame,
-		      op_ret,
-		      op_errno,
-		      vector,
-		      count,
-		      stbuf,
-                      iobref);
+	STACK_UNWIND_STRICT (readv, frame, op_ret, op_errno, vector,
+                             count, stbuf, iobref, xdata);
 	return 0;
 }
 
@@ -1065,7 +937,7 @@ filter_readv (call_frame_t *frame,
 	      xlator_t *this,
 	      fd_t *fd,
 	      size_t size,
-	      off_t offset)
+	      off_t offset, uint32_t flags, dict_t *xdata)
 {
 	STACK_WIND (frame,
 		    filter_readv_cbk,
@@ -1073,7 +945,7 @@ filter_readv (call_frame_t *frame,
 		    FIRST_CHILD(this)->fops->readv,
 		    fd,
 		    size,
-		    offset);
+		    offset, flags, xdata);
 	return 0;
 }
 
@@ -1085,17 +957,17 @@ filter_writev_cbk (call_frame_t *frame,
 		   int32_t op_ret,
 		   int32_t op_errno,
                    struct iatt *prebuf,
-		   struct iatt *postbuf)
+		   struct iatt *postbuf, dict_t *xdata)
 {
 	if (op_ret >= 0) {
 		update_stat (prebuf, this->private);
 		update_stat (postbuf, this->private);
 	}
-	STACK_UNWIND (frame,
+	STACK_UNWIND_STRICT (writev, frame,
 		      op_ret,
 		      op_errno,
 		      prebuf,
-                      postbuf);
+                      postbuf, xdata);
 	return 0;
 }
 
@@ -1105,28 +977,23 @@ filter_writev (call_frame_t *frame,
 	       fd_t *fd,
 	       struct iovec *vector,
 	       int32_t count,
-	       off_t off,
-               struct iobref *iobref)
+	       off_t off, uint32_t flags,
+               struct iobref *iobref, dict_t *xdata)
 {
 	int32_t ret = 0;
 	ret = update_frame (frame, fd->inode, this->private);
 	switch (ret) {
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS, NULL, NULL);
-		return 0;
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        STACK_UNWIND_STRICT (writev, frame, -1, EROFS, NULL,
+                                        NULL, NULL);
+                        return 0;
 	}
 
-	STACK_WIND (frame,
-		    filter_writev_cbk,
-		    FIRST_CHILD(this),
-		    FIRST_CHILD(this)->fops->writev,
-		    fd,
-		    vector,
-		    count,
-		    off,
-                    iobref);
+	STACK_WIND (frame, filter_writev_cbk, FIRST_CHILD(this),
+		    FIRST_CHILD(this)->fops->writev, fd, vector,
+		    count, off, flags, iobref, xdata);
 	return 0;
 }
 
@@ -1136,28 +1003,24 @@ filter_fstat_cbk (call_frame_t *frame,
 		  xlator_t *this,
 		  int32_t op_ret,
 		  int32_t op_errno,
-		  struct iatt *buf)
+		  struct iatt *buf, dict_t *xdata)
 {
 	if (op_ret >= 0) {
 		update_stat (buf, this->private);
 	}
-	STACK_UNWIND (frame,
-		      op_ret,
-		      op_errno,
-		      buf);
+	STACK_UNWIND_STRICT (fstat, frame, op_ret, op_errno,
+		             buf, xdata);
 	return 0;
 }
 
 int32_t
 filter_fstat (call_frame_t *frame,
 	      xlator_t *this,
-	      fd_t *fd)
+	      fd_t *fd, dict_t *xdata)
 {
-	STACK_WIND (frame,
-		    filter_fstat_cbk,
-		    FIRST_CHILD(this),
-		    FIRST_CHILD(this)->fops->fstat,
-		    fd);
+	STACK_WIND (frame, filter_fstat_cbk,
+		    FIRST_CHILD(this), FIRST_CHILD(this)->fops->fstat,
+		    fd, xdata);
 	return 0;
 }
 
@@ -1167,42 +1030,25 @@ filter_opendir_cbk (call_frame_t *frame,
 		    xlator_t *this,
 		    int32_t op_ret,
 		    int32_t op_errno,
-		    fd_t *fd)
+		    fd_t *fd, dict_t *xdata)
 {
-	STACK_UNWIND (frame,
-		      op_ret,
-		      op_errno,
-		      fd);
+	STACK_UNWIND_STRICT (opendir, frame, op_ret, op_errno,
+		             fd, xdata);
 	return 0;
 }
 
 int32_t
 filter_opendir (call_frame_t *frame,
 		xlator_t *this,
-		loc_t *loc, fd_t *fd)
+		loc_t *loc, fd_t *fd, dict_t *xdata)
 {
 	int32_t ret = 0;
 	ret = update_frame (frame, loc->inode, this->private);
-	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (loc->inode->st_mode & S_IWGRP)
-			break;
-		if (loc->inode->st_mode & S_IRGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (loc->inode->st_mode & S_IWOTH)
-			break;
-		if (loc->inode->st_mode & S_IROTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, fd);
-		return 0;
-	}			
 	STACK_WIND (frame,
 		    filter_opendir_cbk,
 		    FIRST_CHILD(this),
 		    FIRST_CHILD(this)->fops->opendir,
-		    loc, fd);
+		    loc, fd, xdata);
 	return 0;
 }
 
@@ -1212,11 +1058,10 @@ filter_setxattr_cbk (call_frame_t *frame,
 		     void *cookie,
 		     xlator_t *this,
 		     int32_t op_ret,
-		     int32_t op_errno)
+		     int32_t op_errno, dict_t *xdata)
 {
-	STACK_UNWIND (frame,
-		      op_ret,
-		      op_errno);
+	STACK_UNWIND_STRICT (setxattr, frame,
+		             op_ret, op_errno, xdata);
 	return 0;
 }
 
@@ -1225,35 +1070,22 @@ filter_setxattr (call_frame_t *frame,
 		 xlator_t *this,
 		 loc_t *loc,
 		 dict_t *dict,
-		 int32_t flags)
+		 int32_t flags, dict_t *xdata)
 {
 
 	int32_t ret = 0;
 	ret = update_frame (frame, loc->inode, this->private);
 	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (loc->inode->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (loc->inode->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM);
-		return 0;
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS);
-		return 0;
-	}			
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        STACK_UNWIND_STRICT (setxattr, frame, -1, EROFS, NULL);
+                        return 0;
+	}
 
-	STACK_WIND (frame,
-		    filter_setxattr_cbk,
-		    FIRST_CHILD(this),
-		    FIRST_CHILD(this)->fops->setxattr,
-		    loc,
-		    dict,
-		    flags);
+	STACK_WIND (frame, filter_setxattr_cbk,
+		    FIRST_CHILD(this), FIRST_CHILD(this)->fops->setxattr,
+		    loc, dict, flags, xdata);
 	return 0;
 }
 
@@ -1263,12 +1095,10 @@ filter_getxattr_cbk (call_frame_t *frame,
 		     xlator_t *this,
 		     int32_t op_ret,
 		     int32_t op_errno,
-		     dict_t *dict)
+		     dict_t *dict, dict_t *xdata)
 {
-	STACK_UNWIND (frame,
-		      op_ret,
-		      op_errno,
-		      dict);
+	STACK_UNWIND_STRICT (getxattr, frame, op_ret, op_errno,
+		             dict, xdata);
 	return 0;
 }
 
@@ -1276,28 +1106,14 @@ int32_t
 filter_getxattr (call_frame_t *frame,
 		 xlator_t *this,
 		 loc_t *loc,
-		 const char *name)
+		 const char *name, dict_t *xdata)
 {
 	int32_t ret = 0;
 	ret = update_frame (frame, loc->inode, this->private);
-	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (loc->inode->st_mode & S_IRGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (loc->inode->st_mode & S_IROTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM, NULL);
-		return 0;
-	}			
 
-	STACK_WIND (frame,
-		    filter_getxattr_cbk,
-		    FIRST_CHILD(this),
-		    FIRST_CHILD(this)->fops->getxattr,
-		    loc,
-		    name);
+	STACK_WIND (frame, filter_getxattr_cbk,
+		    FIRST_CHILD(this), FIRST_CHILD(this)->fops->getxattr,
+		    loc, name, xdata);
 	return 0;
 }
 
@@ -1306,9 +1122,9 @@ filter_removexattr_cbk (call_frame_t *frame,
 			void *cookie,
 			xlator_t *this,
 			int32_t op_ret,
-			int32_t op_errno)
+			int32_t op_errno, dict_t *xdata)
 {
-	STACK_UNWIND (frame, op_ret, op_errno);
+	STACK_UNWIND_STRICT (removexattr, frame, op_ret, op_errno, xdata);
 	return 0;
 }
 
@@ -1316,33 +1132,22 @@ int32_t
 filter_removexattr (call_frame_t *frame,
 		    xlator_t *this,
 		    loc_t *loc,
-		    const char *name)
+		    const char *name, dict_t *xdata)
 {
 	int32_t ret = 0;
 	ret = update_frame (frame, loc->inode, this->private);
 	switch (ret) {
-	case GF_FILTER_MAP_UID:
-		if (loc->inode->st_mode & S_IWGRP)
-			break;
-	case GF_FILTER_MAP_BOTH:
-		if (loc->inode->st_mode & S_IWOTH)
-			break;
-		gf_log (this->name, GF_LOG_DEBUG, "%s: returning permission denied", loc->path);
-		STACK_UNWIND (frame, -1, EPERM);
-		return 0;
-	case GF_FILTER_FILTER_UID:
-	case GF_FILTER_FILTER_GID:
-	case GF_FILTER_RO_FS:
-		STACK_UNWIND (frame, -1, EROFS);
-		return 0;
-	}			
+                case GF_FILTER_FILTER_UID:
+                case GF_FILTER_FILTER_GID:
+                case GF_FILTER_RO_FS:
+                        STACK_UNWIND_STRICT (removexattr, frame, -1, EROFS,
+                                             NULL);
+                        return 0;
+	}
 
-	STACK_WIND (frame,
-		    filter_removexattr_cbk,
-		    FIRST_CHILD(this),
-		    FIRST_CHILD(this)->fops->removexattr,
-		    loc,
-		    name);
+	STACK_WIND (frame, filter_removexattr_cbk,
+		    FIRST_CHILD(this), FIRST_CHILD(this)->fops->removexattr,
+		    loc, name, xdata);
 	return 0;
 }
 
@@ -1355,32 +1160,32 @@ mem_acct_init (xlator_t *this)
                 return ret;
 
         ret = xlator_mem_acct_init (this, gf_filter_mt_end + 1);
-        
+
         if (ret != 0) {
                 gf_log (this->name, GF_LOG_ERROR, "Memory accounting init"
-                        "failed");
+                        " failed");
                 return ret;
         }
 
         return ret;
 }
 
-int32_t 
+int32_t
 init (xlator_t *this)
 {
-	char *value = NULL;
-	char *tmp_str = NULL;
-	char *tmp_str1 = NULL;
-	char *tmp_str2 = NULL;
-	char *dup_str = NULL;
-	char *input_value_str1 = NULL;
-	char *input_value_str2 = NULL;
-	char *output_value_str = NULL;
-	int32_t input_value = 0;
-	int32_t output_value = 0;
-	data_t *option_data = NULL;
-	struct gf_filter *filter = NULL;
-	gf_boolean_t tmp_bool = 0;
+	char                    *value = NULL;
+	char                    *tmp_str = NULL;
+	char                    *tmp_str1 = NULL;
+	char                    *tmp_str2 = NULL;
+	char                    *dup_str = NULL;
+	char                    *input_value_str1 = NULL;
+	char                    *input_value_str2 = NULL;
+	char                    *output_value_str = NULL;
+	int32_t                 input_value = 0;
+	int32_t                 output_value = 0;
+	data_t                  *option_data = NULL;
+	struct gf_filter        *filter = NULL;
+	gf_boolean_t            tmp_bool = 0;
 
 	if (!this->children || this->children->next) {
 		gf_log (this->name,
@@ -1388,15 +1193,20 @@ init (xlator_t *this)
 			"translator not configured with exactly one child");
 		return -1;
 	}
-	
+
 	if (!this->parents) {
 		gf_log (this->name, GF_LOG_WARNING,
 			"dangling volume. check volfile ");
 	}
 
 	filter = GF_CALLOC (sizeof (*filter), 1, gf_filter_mt_gf_filter);
-	ERR_ABORT (filter);
-	
+
+        if (!filter) {
+                gf_log (this->name, GF_LOG_ERROR,
+                        "Unable to allocate memory");
+                return -1;
+        }
+
 	if (dict_get (this->options, "read-only")) {
 		value = data_to_str (dict_get (this->options, "read-only"));
 		if (gf_string2boolean (value, &filter->complete_read_only) == -1) {
@@ -1414,14 +1224,15 @@ init (xlator_t *this)
 			return -1;
 		}
 		if (tmp_bool) {
+                        filter->root_squash               = _gf_true;
 			filter->translate_num_uid_entries = 1;
 			filter->translate_num_gid_entries = 1;
 			filter->translate_input_uid[0][0] = GF_FILTER_ROOT_UID; /* root */
 			filter->translate_input_uid[0][1] = GF_FILTER_ROOT_UID; /* root */
 			filter->translate_input_gid[0][0] = GF_FILTER_ROOT_GID; /* root */
 			filter->translate_input_gid[0][1] = GF_FILTER_ROOT_GID; /* root */
-			filter->translate_output_uid[0] = GF_FILTER_NOBODY_UID;
-			filter->translate_output_gid[0] = GF_FILTER_NOBODY_GID;
+			filter->translate_output_uid[0]   = GF_FILTER_NOBODY_UID;
+			filter->translate_output_gid[0]   = GF_FILTER_NOBODY_GID;
 		}
 	}
 
@@ -1436,8 +1247,8 @@ init (xlator_t *this)
 				char *temp_string = gf_strdup (input_value_str1);
 				input_value_str2 = strtok_r (temp_string, "-", &tmp_str2);
 				if (gf_string2int (input_value_str2, &input_value) != 0) {
-					gf_log (this->name, GF_LOG_ERROR, 
-						"invalid number format \"%s\"", 
+					gf_log (this->name, GF_LOG_ERROR,
+						"invalid number format \"%s\"",
 						input_value_str2);
 					return -1;
 				}
@@ -1445,8 +1256,8 @@ init (xlator_t *this)
 				input_value_str2 = strtok_r (NULL, "-", &tmp_str2);
 				if (input_value_str2) {
 					if (gf_string2int (input_value_str2, &input_value) != 0) {
-						gf_log (this->name, GF_LOG_ERROR, 
-							"invalid number format \"%s\"", 
+						gf_log (this->name, GF_LOG_ERROR,
+							"invalid number format \"%s\"",
 							input_value_str2);
 						return -1;
 					}
@@ -1456,25 +1267,25 @@ init (xlator_t *this)
 				output_value_str = strtok_r (NULL, "=", &tmp_str1);
 				if (output_value_str) {
 					if (gf_string2int (output_value_str, &output_value) != 0) {
-						gf_log (this->name, GF_LOG_ERROR, 
-							"invalid number format \"%s\"", 
+						gf_log (this->name, GF_LOG_ERROR,
+							"invalid number format \"%s\"",
 							output_value_str);
 						return -1;
 					}
 				} else {
-					gf_log (this->name, GF_LOG_ERROR, 
+					gf_log (this->name, GF_LOG_ERROR,
 						"mapping string not valid");
 					return -1;
 				}
 			} else {
-				gf_log (this->name, GF_LOG_ERROR, 
+				gf_log (this->name, GF_LOG_ERROR,
 					"mapping string not valid");
 				return -1;
 			}
 			filter->translate_output_uid[filter->translate_num_uid_entries]   = output_value;
-			gf_log (this->name, 
-				GF_LOG_DEBUG, 
-				"pair %d: input uid '%d' will be changed to uid '%d'", 
+			gf_log (this->name,
+				GF_LOG_DEBUG,
+				"pair %d: input uid '%d' will be changed to uid '%d'",
 				filter->translate_num_uid_entries, input_value, output_value);
 
 			filter->translate_num_uid_entries++;
@@ -1500,8 +1311,8 @@ init (xlator_t *this)
 				char *temp_string = gf_strdup (input_value_str1);
 				input_value_str2 = strtok_r (temp_string, "-", &tmp_str2);
 				if (gf_string2int (input_value_str2, &input_value) != 0) {
-					gf_log (this->name, GF_LOG_ERROR, 
-						"invalid number format \"%s\"", 
+					gf_log (this->name, GF_LOG_ERROR,
+						"invalid number format \"%s\"",
 						input_value_str2);
 					return -1;
 				}
@@ -1509,8 +1320,8 @@ init (xlator_t *this)
 				input_value_str2 = strtok_r (NULL, "-", &tmp_str2);
 				if (input_value_str2) {
 					if (gf_string2int (input_value_str2, &input_value) != 0) {
-						gf_log (this->name, GF_LOG_ERROR, 
-							"invalid number format \"%s\"", 
+						gf_log (this->name, GF_LOG_ERROR,
+							"invalid number format \"%s\"",
 							input_value_str2);
 						return -1;
 					}
@@ -1520,28 +1331,28 @@ init (xlator_t *this)
 				output_value_str = strtok_r (NULL, "=", &tmp_str1);
 				if (output_value_str) {
 					if (gf_string2int (output_value_str, &output_value) != 0) {
-						gf_log (this->name, GF_LOG_ERROR, 
-							"invalid number format \"%s\"", 
+						gf_log (this->name, GF_LOG_ERROR,
+							"invalid number format \"%s\"",
 							output_value_str);
 						return -1;
 					}
 				} else {
-					gf_log (this->name, GF_LOG_ERROR, 
+					gf_log (this->name, GF_LOG_ERROR,
 						"translate-gid value not valid");
 					return -1;
 				}
 			} else {
-				gf_log (this->name, GF_LOG_ERROR, 
+				gf_log (this->name, GF_LOG_ERROR,
 					"translate-gid value not valid");
 				return -1;
 			}
-			
+
 			filter->translate_output_gid[filter->translate_num_gid_entries] = output_value;
-			
-			gf_log (this->name, GF_LOG_DEBUG, 
-				"pair %d: input gid '%d' will be changed to gid '%d'", 
+
+			gf_log (this->name, GF_LOG_DEBUG,
+				"pair %d: input gid '%d' will be changed to gid '%d'",
 				filter->translate_num_gid_entries, input_value, output_value);
-			
+
 			filter->translate_num_gid_entries++;
 			if (filter->translate_num_gid_entries == GF_MAXIMUM_FILTERING_ALLOWED)
 				break;
@@ -1561,8 +1372,8 @@ init (xlator_t *this)
 			/* Check for n-m */
 			input_value_str1 = strtok_r (dup_str, "-", &tmp_str1);
 			if (gf_string2int (input_value_str1, &input_value) != 0) {
-				gf_log (this->name, GF_LOG_ERROR, 
-					"invalid number format \"%s\"", 
+				gf_log (this->name, GF_LOG_ERROR,
+					"invalid number format \"%s\"",
 					input_value_str1);
 				return -1;
 			}
@@ -1570,19 +1381,19 @@ init (xlator_t *this)
 			input_value_str1 = strtok_r (NULL, "-", &tmp_str1);
 			if (input_value_str1) {
 				if (gf_string2int (input_value_str1, &input_value) != 0) {
-					gf_log (this->name, GF_LOG_ERROR, 
-						"invalid number format \"%s\"", 
+					gf_log (this->name, GF_LOG_ERROR,
+						"invalid number format \"%s\"",
 						input_value_str1);
 					return -1;
 				}
 			}
 			filter->filter_input_uid[filter->filter_num_uid_entries][1] = input_value;
 
-			gf_log (this->name, 
-				GF_LOG_DEBUG, 
-				"filter [%d]: input uid(s) '%s' will be filtered", 
+			gf_log (this->name,
+				GF_LOG_DEBUG,
+				"filter [%d]: input uid(s) '%s' will be filtered",
 				filter->filter_num_uid_entries, dup_str);
-			
+
 			filter->filter_num_uid_entries++;
 			if (filter->filter_num_uid_entries == GF_MAXIMUM_FILTERING_ALLOWED)
 				break;
@@ -1603,8 +1414,8 @@ init (xlator_t *this)
 			/* Check for n-m */
 			input_value_str1 = strtok_r (dup_str, "-", &tmp_str1);
 			if (gf_string2int (input_value_str1, &input_value) != 0) {
-				gf_log (this->name, GF_LOG_ERROR, 
-					"invalid number format \"%s\"", 
+				gf_log (this->name, GF_LOG_ERROR,
+					"invalid number format \"%s\"",
 					input_value_str1);
 				return -1;
 			}
@@ -1612,19 +1423,19 @@ init (xlator_t *this)
 			input_value_str1 = strtok_r (NULL, "-", &tmp_str1);
 			if (input_value_str1) {
 				if (gf_string2int (input_value_str1, &input_value) != 0) {
-					gf_log (this->name, GF_LOG_ERROR, 
-						"invalid number format \"%s\"", 
+					gf_log (this->name, GF_LOG_ERROR,
+						"invalid number format \"%s\"",
 						input_value_str1);
 					return -1;
 				}
 			}
 			filter->filter_input_gid[filter->filter_num_gid_entries][1] = input_value;
 
-			gf_log (this->name, 
-				GF_LOG_DEBUG, 
-				"filter [%d]: input gid(s) '%s' will be filtered", 
+			gf_log (this->name,
+				GF_LOG_DEBUG,
+				"filter [%d]: input gid(s) '%s' will be filtered",
 				filter->filter_num_gid_entries, dup_str);
-			
+
 			filter->filter_num_gid_entries++;
 			if (filter->filter_num_gid_entries == GF_MAXIMUM_FILTERING_ALLOWED)
 				break;
@@ -1639,8 +1450,8 @@ init (xlator_t *this)
 	if (dict_get (this->options, "fixed-uid")) {
 		option_data = dict_get (this->options, "fixed-uid");
 		if (gf_string2int (option_data->data, &input_value) != 0) {
-			gf_log (this->name, GF_LOG_ERROR, 
-				"invalid number format \"%s\"", 
+			gf_log (this->name, GF_LOG_ERROR,
+				"invalid number format \"%s\"",
 				option_data->data);
 			return -1;
 		}
@@ -1651,8 +1462,8 @@ init (xlator_t *this)
 	if (dict_get (this->options, "fixed-gid")) {
 		option_data = dict_get (this->options, "fixed-gid");
 		if (gf_string2int (option_data->data, &input_value) != 0) {
-			gf_log (this->name, GF_LOG_ERROR, 
-				"invalid number format \"%s\"", 
+			gf_log (this->name, GF_LOG_ERROR,
+				"invalid number format \"%s\"",
 				option_data->data);
 			return -1;
 		}
@@ -1706,29 +1517,29 @@ struct xlator_cbks cbks = {
 };
 
 struct volume_options options[] = {
-	{ .key  = { "root-squashing" }, 
-	  .type = GF_OPTION_TYPE_BOOL 
-	},
-	{ .key  = { "read-only" }, 
+	{ .key  = { "root-squashing" },
 	  .type = GF_OPTION_TYPE_BOOL
 	},
-	{ .key  = { "fixed-uid" },  
+	{ .key  = { "read-only" },
+	  .type = GF_OPTION_TYPE_BOOL
+	},
+	{ .key  = { "fixed-uid" },
 	  .type = GF_OPTION_TYPE_INT
 	},
-	{ .key  = { "fixed-gid" },  
+	{ .key  = { "fixed-gid" },
 	  .type = GF_OPTION_TYPE_INT
 	},
-	{ .key  = { "translate-uid" },  
-	  .type = GF_OPTION_TYPE_ANY 
-	},
-	{ .key  = { "translate-gid" },  
+	{ .key  = { "translate-uid" },
 	  .type = GF_OPTION_TYPE_ANY
 	},
-	{ .key  = { "filter-uid" },  
-	  .type = GF_OPTION_TYPE_ANY 
+	{ .key  = { "translate-gid" },
+	  .type = GF_OPTION_TYPE_ANY
 	},
-	{ .key  = { "filter-gid" },  
-	  .type = GF_OPTION_TYPE_ANY 
+	{ .key  = { "filter-uid" },
+	  .type = GF_OPTION_TYPE_ANY
+	},
+	{ .key  = { "filter-gid" },
+	  .type = GF_OPTION_TYPE_ANY
 	},
 	{ .key = {NULL} },
 };

@@ -1,3 +1,3 @@
-SUBDIRS = locks quota read-only mac-compat quiesce marker index # trash path-converter # filter
+SUBDIRS = locks quota read-only mac-compat quiesce marker index filter # trash path-converter
 
 CLEANFILES =
